@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login Dsavee</title>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap"
+    />
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        font-family: "Poppins", sans-serif;
+        background: #e6d8c7;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+      }
+
+      .login-container {
+        background: #ffffff;
+        padding: 2.5rem;
+        border-radius: 20px;
+        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+        width: 100%;
+        max-width: 400px;
+        text-align: center;
+      }
+
+      .login-container img {
+        width: 120px;
+        margin-bottom: 1rem;
+        border-radius: 25px;
+      }
+
+      h2 {
+        color: #0d2b52;
+        margin-bottom: 1.5rem;
+      }
+
+      .form-input {
+        width: 100%;
+        padding: 12px 15px;
+        margin: 10px 0;
+        border: 1px solid #cdd6e0;
+        border-radius: 10px;
+        outline: none;
+        transition: 0.3s;
+      }
+
+      .form-input:focus {
+        border-color: #3a73c2;
+        box-shadow: 0 0 8px rgba(58, 115, 194, 0.3);
+      }
+
+      .login-btn {
+        width: 100%;
+        padding: 12px;
+        margin-top: 1rem;
+        background: linear-gradient(135deg, #0d2b52, #3a73c2);
+        border: none;
+        border-radius: 12px;
+        color: #fff;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+
+      .login-btn:hover {
+        transform: translateY(-3px);
+        box-shadow: 0 6px 15px rgba(0, 0, 0, 0.15);
+      }
+
+      .login-footer {
+        margin-top: 1.5rem;
+        font-size: 0.9rem;
+      }
+
+      .login-footer a {
+        color: #3a73c2;
+        text-decoration: none;
+        font-weight: 500;
+      }
+
+      .login-footer a:hover {
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="login-container">
+      <img src="../images/logo2-removebg-preview.png" alt="Dsavee Logo" />
+      <h2>Login ke Dsavee</h2>
+      <form id="loginForm">
+        <input
+          type="email"
+          name="email"
+          placeholder="Email"
+          class="form-input"
+          required
+        />
+        <input
+          type="password"
+          name="password"
+          placeholder="Password"
+          class="form-input"
+          required
+        />
+        <button type="submit" class="login-btn">Login</button>
+      </form>
+      <div class="login-footer">
+        <p>Belum punya akun? <a href="signup.html">Daftar sekarang</a></p>
+      </div>
+    </div>
+
+    <script src="js/jquery-1.11.0.min.js"></script>
+    <script src="js/auth.js"></script>
+  </body>
+</html>
