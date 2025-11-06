@@ -1,21 +1,21 @@
 {
   "files": {
-    "main.css": "/static/css/main.181e09d1.css",
-    "main.js": "/static/js/main.20e3df84.js",
-    "static/js/724.a93e5a65.chunk.js": "/static/js/724.a93e5a65.chunk.js",
-    "static/js/239.5ffe5ff9.chunk.js": "/static/js/239.5ffe5ff9.chunk.js",
-    "static/js/977.b3c586be.chunk.js": "/static/js/977.b3c586be.chunk.js",
-    "static/js/455.fbdd1f79.chunk.js": "/static/js/455.fbdd1f79.chunk.js",
-    "index.html": "/index.html",
-    "main.181e09d1.css.map": "/static/css/main.181e09d1.css.map",
-    "main.20e3df84.js.map": "/static/js/main.20e3df84.js.map",
-    "724.a93e5a65.chunk.js.map": "/static/js/724.a93e5a65.chunk.js.map",
-    "239.5ffe5ff9.chunk.js.map": "/static/js/239.5ffe5ff9.chunk.js.map",
-    "977.b3c586be.chunk.js.map": "/static/js/977.b3c586be.chunk.js.map",
-    "455.fbdd1f79.chunk.js.map": "/static/js/455.fbdd1f79.chunk.js.map"
+    "main.css": "/dsavee-sticker/static/css/main.181e09d1.css",
+    "main.js": "/dsavee-sticker/static/js/main.745ecb4e.js",
+    "static/js/724.a93e5a65.chunk.js": "/dsavee-sticker/static/js/724.a93e5a65.chunk.js",
+    "static/js/239.5ffe5ff9.chunk.js": "/dsavee-sticker/static/js/239.5ffe5ff9.chunk.js",
+    "static/js/977.b3c586be.chunk.js": "/dsavee-sticker/static/js/977.b3c586be.chunk.js",
+    "static/js/455.fbdd1f79.chunk.js": "/dsavee-sticker/static/js/455.fbdd1f79.chunk.js",
+    "index.html": "/dsavee-sticker/index.html",
+    "main.181e09d1.css.map": "/dsavee-sticker/static/css/main.181e09d1.css.map",
+    "main.745ecb4e.js.map": "/dsavee-sticker/static/js/main.745ecb4e.js.map",
+    "724.a93e5a65.chunk.js.map": "/dsavee-sticker/static/js/724.a93e5a65.chunk.js.map",
+    "239.5ffe5ff9.chunk.js.map": "/dsavee-sticker/static/js/239.5ffe5ff9.chunk.js.map",
+    "977.b3c586be.chunk.js.map": "/dsavee-sticker/static/js/977.b3c586be.chunk.js.map",
+    "455.fbdd1f79.chunk.js.map": "/dsavee-sticker/static/js/455.fbdd1f79.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.181e09d1.css",
-    "static/js/main.20e3df84.js"
+    "static/js/main.745ecb4e.js"
   ]
 }
