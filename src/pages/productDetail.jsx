@@ -1,8 +1,9 @@
+// src/pages/ProductDetail.jsx
 import React, { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { getDatabase, ref, onValue, update } from "firebase/database";
 import QuantityPicker from "../components/quantityPicker";
-import { useCartDispatch } from "../contexts/index";
+import { useCart } from "../contexts/CartContext"; // pakai useCart (usercart)
 
 export default function ProductDetail() {
   const { productId } = useParams();
@@ -10,12 +11,12 @@ export default function ProductDetail() {
   const [product, setProduct] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selectedVariant, setSelectedVariant] = useState(null);
-  const [availableColors, setAvailableColors] = useState([]); // dari DB
+  const [availableColors, setAvailableColors] = useState([]);
   const [selectedColor, setSelectedColor] = useState(null);
   const [qty, setQty] = useState(1);
-  const dispatch = useCartDispatch();
+  // <-- ambil juga cart & updateItemQty dari context agar bisa merge/merge qty
+  const { addToCart, cart = [], updateItemQty } = useCart();
 
-  // Ongkir tetap
   const shippingCost = 10000;
 
   useEffect(() => {
@@ -32,21 +33,22 @@ export default function ProductDetail() {
       (snapshot) => {
         if (snapshot.exists()) {
           const productData = snapshot.val();
-
+          // set product (ambil nilai stok default dari DB jika ada)
           setProduct({
             id: productId,
-            stock: 50,
             ...productData,
           });
 
-          // default variant jika ada
+          // setup variant default
           if (productData.variants && productData.variants.length > 0) {
             setSelectedVariant(productData.variants[0]);
           } else if (productData.color) {
             setSelectedVariant(productData.color);
+          } else {
+            setSelectedVariant(null);
           }
 
-          // Build availableColors dari DB
+          // Build availableColors dari DB (colorOptions) atau dari image fields
           if (
             Array.isArray(productData.colorOptions) &&
             productData.colorOptions.length > 0
@@ -81,7 +83,7 @@ export default function ProductDetail() {
                   (namesArr && namesArr[idx]) ||
                   (idx === 0 ? "Varian 1" : `Varian ${idx + 1}`),
                 value: null,
-                code: key,
+                code: key, // mis. image, image1, image2
                 image: productData[key] || null,
                 imageField: key,
               }));
@@ -116,27 +118,196 @@ export default function ProductDetail() {
     return () => unsubscribe();
   }, [productId]);
 
-  // pilih gambar berdasarkan selectedColor / product
-  function getImageForColor(product, color) {
-    if (!product) return "/images/placeholder.png";
-    if (!color) {
-      return product.image || "/images/placeholder.png";
-    }
+  // helper: ambil gambar berdasarkan selectedColor / product
+  function selectedImageForProduct(prod, color) {
+    if (!prod) return "/images/placeholder.png";
+    if (!color) return prod.image || "/images/placeholder.png";
     if (color.image) return color.image;
-    if (color.imageField && product[color.imageField])
-      return product[color.imageField];
-    return product.image || "/images/placeholder.png";
+    if (color.imageField && prod[color.imageField])
+      return prod[color.imageField];
+    return prod.image || "/images/placeholder.png";
   }
 
-  const selectedImage = getImageForColor(product, selectedColor);
+  // helper kecil: buat string unik untuk variant dan color
+  function serializeForId(value) {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") {
+      return value.replace(/\s+/g, "-").replace(/[^\w-.:]/g, "");
+    }
+    if (typeof value === "object") {
+      return (
+        (value.code && String(value.code)) ||
+        (value.name && String(value.name)) ||
+        (value.value && String(value.value)) ||
+        JSON.stringify(value)
+      )
+        .replace(/\s+/g, "-")
+        .replace(/[^\w-.:]/g, "");
+    }
+    return String(value)
+      .replace(/\s+/g, "-")
+      .replace(/[^\w-.:]/g, "");
+  }
 
-  const updateStock = async (productId, quantity) => {
+  // generate unique cart id per combination product + variant + color
+  // (tetap ada tapi tidak lagi dipakai untuk id utama; tidak menghapus agar logic lain tetap utuh)
+  function makeCartItemId(prodId, variant, color) {
+    const v = serializeForId(variant);
+    const c = serializeForId(color);
+    if (!v && !c) return prodId; // no spec -> plain product id
+    return `${prodId}::v=${v}::c=${c}`;
+  }
+
+  // Helper: map imageField -> stock field name
+  function imageFieldToStockField(imageField) {
+    if (!imageField) return "stock";
+    const key = String(imageField || "").toLowerCase();
+    if (key === "image" || key === "image0") return "stock";
+    if (key === "image1") return "stock1";
+    if (key === "image2") return "stock2";
+    // if image field contains '1' or '2' at end, try to detect
+    if (key.endsWith("1")) return "stock1";
+    if (key.endsWith("2")) return "stock2";
+    return "stock";
+  }
+
+  // New: get stock value for selected variant/color
+  function getVariantStock(prod, color, variant) {
+    try {
+      if (!prod) return 0;
+      // 1) if color has imageField -> map directly
+      if (color && color.imageField) {
+        const stockField = imageFieldToStockField(color.imageField);
+        const val = prod[stockField];
+        return Number(val ?? 0);
+      }
+
+      // 2) if color has image -> match against image/image1/image2
+      if (color && color.image) {
+        if (prod.image && prod.image === color.image)
+          return Number(prod.stock ?? 0);
+        if (prod.image1 && prod.image1 === color.image)
+          return Number(prod.stock1 ?? 0);
+        if (prod.image2 && prod.image2 === color.image)
+          return Number(prod.stock2 ?? 0);
+      }
+
+      // 3) if variant index-like (e.g. variant === 0/1/2) -> map by index
+      if (variant !== null && variant !== undefined) {
+        const maybeIdx = Number(variant);
+        if (!Number.isNaN(maybeIdx)) {
+          if (maybeIdx === 0) return Number(prod.stock ?? 0);
+          if (maybeIdx === 1) return Number(prod.stock1 ?? 0);
+          if (maybeIdx === 2) return Number(prod.stock2 ?? 0);
+        }
+        // sometimes variant is a string like 'Varian 2' -> try to detect digit
+        const m = String(variant).match(/\d+/);
+        if (m) {
+          const idx = Number(m[0]) - 1; // human number -> index
+          if (idx === 0) return Number(prod.stock ?? 0);
+          if (idx === 1) return Number(prod.stock1 ?? 0);
+          if (idx === 2) return Number(prod.stock2 ?? 0);
+        }
+      }
+
+      // 4) fallback: prefer stock, else stock1, else stock2
+      if (prod.hasOwnProperty("stock")) return Number(prod.stock ?? 0);
+      if (prod.hasOwnProperty("stock1")) return Number(prod.stock1 ?? 0);
+      if (prod.hasOwnProperty("stock2")) return Number(prod.stock2 ?? 0);
+      return 0;
+    } catch (e) {
+      console.error("getVariantStock error:", e);
+      return 0;
+    }
+  }
+
+  // handler add to cart (gunakan addToCart dari context)
+  async function addToCartHandler() {
+    if (!product) return;
+
+    const currentVariantStock = getVariantStock(
+      product,
+      selectedColor,
+      selectedVariant
+    );
+
+    if (currentVariantStock < qty) {
+      alert(
+        `Maaf, stok tidak mencukupi untuk varian ini. Stok tersedia: ${currentVariantStock}`
+      );
+      return;
+    }
+
+    // === Perubahan logika: gunakan id sederhana (product.id) sesuai struktur DB Anda ===
+    const simpleId = product.id;
+
+    // prepare payload matching DB structure (types sanitized)
+    const payload = {
+      id: simpleId, // "product-1"
+      image:
+        selectedImageForProduct(product, selectedColor) ||
+        product.image ||
+        "/images/placeholder.png",
+      name: product.name || "",
+      price: Number(product.price) || 0,
+      qty: Number(qty) || 1,
+      size: product.size || "",
+      // keep metadata but not part of id
+      variant: selectedVariant,
+      color: selectedColor,
+      productId: product.id,
+      shippingCost,
+    };
+
+    // check existing item in cart by simple id (product.id)
+    const existing = (cart || []).find((ci) => ci.id === simpleId);
+
+    if (existing && typeof updateItemQty === "function") {
+      // merge qty: tambah ke existing.qty
+      const newQty = Number(existing.qty || 0) + Number(payload.qty || 0);
+      updateItemQty({
+        _cid: existing._cid, // kalau context menggunakan _cid
+        id: existing.id,
+        variant: payload.variant,
+        qty: newQty,
+      });
+    } else {
+      // add new item (payload matches screenshot DB)
+      addToCart(payload);
+    }
+
+    alert(
+      `${product.name} (${
+        selectedColor?.name || selectedVariant || "Default"
+      }) berhasil ditambahkan ke cart!`
+    );
+  }
+
+  // gunakan helper yang konsisten
+  const selectedImage = selectedImageForProduct(product, selectedColor);
+
+  // compute current stock for selected variant
+  const currentVariantStock = getVariantStock(
+    product,
+    selectedColor,
+    selectedVariant
+  );
+
+  // ensure qty does not exceed stock when product or variant changes
+  useEffect(() => {
+    if (qty > currentVariantStock) {
+      setQty(currentVariantStock > 0 ? currentVariantStock : 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentVariantStock, productId, selectedColor, selectedVariant]);
+
+  // (optional) function to update product.stock (ke root stock) - keep but do not use for variant updates
+  const updateStock = async (productIdArg, quantity) => {
     const db = getDatabase();
-    const productRef = ref(db, `products/${productId}`);
+    const productRef = ref(db, `products/${productIdArg}`);
 
     try {
-      // gunakan nullish coalescing agar 0 tetap 0
-      const currentStock = product?.stock ?? 50;
+      const currentStock = Number(product?.stock ?? 0);
       const newStock = Math.max(0, currentStock - quantity);
 
       await update(productRef, {
@@ -150,19 +321,20 @@ export default function ProductDetail() {
     }
   };
 
-  function getProductDescription(product) {
-    if (product.description) {
-      return product.description;
+  function getProductDescription(prod) {
+    if (!prod) return "";
+    if (prod.description) {
+      return prod.description;
     }
 
-    const productName = (product.name || "").toLowerCase();
+    const productName = (prod.name || "").toLowerCase();
 
     if (
       productName.includes("juice") ||
       productName.includes("drink") ||
       productName.includes("beverage")
     ) {
-      return `Enjoy the refreshing taste of our ${product.name}, made from 100% natural ingredients. Perfect for hot days, this beverage is packed with vitamins and natural sweetness. No added preservatives or artificial flavors. Stay hydrated and healthy with every sip.`;
+      return `Enjoy the refreshing taste of our ${prod.name}, made from 100% natural ingredients. Perfect for hot days, this beverage is packed with vitamins and natural sweetness. No added preservatives or artificial flavors. Stay hydrated and healthy with every sip.`;
     }
 
     if (
@@ -170,48 +342,32 @@ export default function ProductDetail() {
       productName.includes("cookie") ||
       productName.includes("snack")
     ) {
-      return `Our premium ${product.name} are baked to perfection with the finest ingredients. Crispy, buttery, and delicious - perfect for tea time or as a quick snack. Each piece is carefully crafted for the ultimate taste experience. Great for sharing with family and friends.`;
+      return `Our premium ${prod.name} are baked to perfection with the finest ingredients. Crispy, buttery, and delicious - perfect for tea time or as a quick snack. Each piece is carefully crafted for the ultimate taste experience. Great for sharing with family and friends.`;
     }
 
     if (productName.includes("sticker") || productName.includes("decals")) {
-      return `High-quality ${product.name} made with durable vinyl material. Perfect for personalizing your laptop, water bottle, phone case, or any smooth surface. Easy to apply and remove without leaving residue. Water-resistant and long-lasting. Express your style with our unique designs.`;
+      return `High-quality ${prod.name} made with durable vinyl material. Perfect for personalizing your laptop, water bottle, phone case, or any smooth surface. Easy to apply and remove without leaving residue. Water-resistant and long-lasting. Express your style with our unique designs.`;
     }
 
-    return `${product.name} is a premium quality product designed for your satisfaction. Made with excellent craftsmanship and attention to detail, this product offers great value and performance. Perfect for everyday use or as a special gift.`;
-  }
-
-  async function addToCart() {
-    if (!product) return;
-
-    const currentStock = product?.stock ?? 50; // gunakan ?? bukan ||
-    if (currentStock < qty) {
-      alert(`Maaf, stok tidak mencukupi. Stok tersedia: ${currentStock}`);
-      return;
-    }
-
-    // hanya tambahkan ke cart, jangan ubah stok
-    dispatch({
-      type: "ADD_ITEM",
-      payload: {
-        id: product.id,
-        name: product.name,
-        price: Number(product.price) || 0,
-        qty: Number(qty) || 1,
-        size: product.size,
-        image: selectedImage,
-        variant: selectedVariant,
-        color: selectedColor,
-        shippingCost,
-      },
-    });
-
-    alert(
-      `${product.name} (${selectedColor?.name}) berhasil ditambahkan ke cart!`
-    );
+    return `${prod.name} is a premium quality product designed for your satisfaction. Made with excellent craftsmanship and attention to detail, this product offers great value and performance. Perfect for everyday use or as a special gift.`;
   }
 
   function getButtonPropsFromColor(color) {
-    if (!color) return { className: "btn btn-primary btn-lg" };
+    // Warna dasar orange cerah (#ffc43f)
+    const orange = "#ffc43f";
+    const white = "#ffffff"; // putih supaya kontras dan tetap elegan
+
+    if (!color) {
+      return {
+        className: "btn btn-lg",
+        style: {
+          backgroundColor: orange,
+          color: white,
+          border: "1px solid #e0d6c5",
+        },
+      };
+    }
+
     const bsVariants = [
       "primary",
       "secondary",
@@ -222,9 +378,17 @@ export default function ProductDetail() {
       "light",
       "dark",
     ];
+
     if (bsVariants.includes(color.code)) {
-      return { className: `btn btn-${color.code} btn-lg` };
+      return {
+        className: `btn btn-${color.code} btn-lg`,
+        style: {
+          backgroundColor: orange,
+          color: white,
+        },
+      };
     }
+
     if (color.value) {
       return {
         className: "btn btn-lg",
@@ -234,7 +398,14 @@ export default function ProductDetail() {
         },
       };
     }
-    return { className: "btn btn-lg" };
+
+    return {
+      className: "btn btn-lg",
+      style: {
+        backgroundColor: orange,
+        color: white,
+      },
+    };
   }
 
   function getContrastColor(bg) {
@@ -296,7 +467,7 @@ export default function ProductDetail() {
     typeof rawPrice === "number" ? rawPrice : parseFloat(rawPrice);
   const safePrice = Number.isFinite(priceNum) ? priceNum : 0;
   const totalPrice = safePrice * qty + shippingCost;
-  const currentStock = product.stock ?? 50;
+  const currentStock = currentVariantStock; // stok sesuai varian yang dipilih
 
   const btnProps = getButtonPropsFromColor(selectedColor);
 
@@ -320,16 +491,13 @@ export default function ProductDetail() {
             className="btn btn-outline-secondary mb-4"
             onClick={() => navigate(-1)}
           >
-            ← Back to Products
+            ← Back
           </button>
 
           <h1 className="h2 mb-3">{product.name}</h1>
 
           {product.size && (
-            <p className="text-muted mb-3">
-              <i className="uil uil-ruler me-2"></i>
-              Size: {product.size}
-            </p>
+            <p className="text-muted mb-3">Size: {product.size}</p>
           )}
 
           <div className="stock-info mb-3">
@@ -342,13 +510,17 @@ export default function ProductDetail() {
                   : "bg-danger";
               const textClass =
                 bgClass === "bg-warning" ? "text-dark" : "text-white";
+              // juga tampilkan keterangan varian jika ada
+              const variantLabel =
+                selectedColor?.name ||
+                (selectedVariant ? String(selectedVariant) : "Default");
               return (
                 <span
                   className={`badge ${bgClass} ${textClass}`}
                   style={{ opacity: 1 }}
                 >
                   <i className="uil uil-package me-1"></i>
-                  Stok: {currentStock} pcs
+                  Stok ({variantLabel}): {currentStock} pcs
                 </span>
               );
             })()}
@@ -388,6 +560,7 @@ export default function ProductDetail() {
               </small>
             )}
           </div>
+
           <div className="price my-4">
             <h3 className="text-primary">Rp{safePrice.toFixed(2)}</h3>
           </div>
@@ -411,7 +584,7 @@ export default function ProductDetail() {
             <div className="mb-4">
               <h6 className="mb-3">
                 <i className="uil uil-palette me-2"></i>
-                Pilih Warna / Varian:
+                Pilih Varian:
               </h6>
               <div className="d-flex gap-3 flex-wrap">
                 {availableColors.map((color, index) => (
@@ -503,14 +676,11 @@ export default function ProductDetail() {
           )}
 
           <div className="shipping-info mb-4 p-3 bg-light rounded">
-            <h6 className="mb-2">
-              <i className="uil uil-truck me-2"></i>
-              Informasi Pengiriman:
-            </h6>
+            <h6 className="mb-2">Informasi Pengiriman:</h6>
             <div className="row">
               <div className="col-6">
                 <small className="text-muted">Lokasi:</small>
-                <p className="mb-1 small fw-bold">Kecamatan Airmadidi</p>
+                <p className="mb-1 small fw-bold">Airmadidi</p>
               </div>
               <div className="col-6">
                 <small className="text-muted">Ongkir:</small>
@@ -526,59 +696,19 @@ export default function ProductDetail() {
             <QuantityPicker qty={qty} onChange={setQty} max={currentStock} />
           </div>
 
-          <div className="total-price mb-4 p-3 bg-primary text-white rounded">
-            <div className="d-flex justify-content-between">
-              <span>Subtotal:</span>
-              <span>Rp{(safePrice * qty).toFixed(2)}</span>
-            </div>
-            <div className="d-flex justify-content-between">
-              <span>Ongkir:</span>
-              <span>Rp{shippingCost.toFixed(2)}</span>
-            </div>
-            <hr className="my-2" />
-            <div className="d-flex justify-content-between fw-bold">
-              <span>Total:</span>
-              <span>Rp{totalPrice.toFixed(2)}</span>
-            </div>
-          </div>
-
           <button
             {...(btnProps.style ? { style: btnProps.style } : {})}
             className={btnProps.className + " w-100 py-3 fw-bold"}
-            onClick={addToCart}
+            onClick={addToCartHandler}
             disabled={currentStock === 0 || qty > currentStock}
           >
             <i className="uil uil-shopping-cart me-2"></i>
             {currentStock === 0
               ? "Stok Habis"
-              : `Add to Cart (${selectedColor?.name})`}
+              : `Add to Cart (${
+                  selectedColor?.name || selectedVariant || "Default"
+                })`}
           </button>
-
-          <div className="mt-4 pt-3 border-top">
-            <div className="row text-center">
-              <div className="col-4">
-                <i
-                  className="uil uil-truck text-primary mb-2"
-                  style={{ fontSize: "1.5rem" }}
-                ></i>
-                <p className="small mb-0">Airmadidi Only</p>
-              </div>
-              <div className="col-4">
-                <i
-                  className="uil uil-shield-check text-primary mb-2"
-                  style={{ fontSize: "1.5rem" }}
-                ></i>
-                <p className="small mb-0">Quality Guarantee</p>
-              </div>
-              <div className="col-4">
-                <i
-                  className="uil uil-package text-primary mb-2"
-                  style={{ fontSize: "1.5rem" }}
-                ></i>
-                <p className="small mb-0 fw-bold">Stock: {currentStock}</p>{" "}
-              </div>
-            </div>
-          </div>
         </div>
       </div>
     </div>

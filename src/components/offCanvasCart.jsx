@@ -1,12 +1,20 @@
-// src/components/OffcanvasCart.jsx
-import React from "react";
+// src/components/offCanvasCart.jsx
+import React, { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { useCartState, useCartDispatch } from "../contexts/index";
+import { useCart } from "../contexts/CartContext";
 
 export default function OffcanvasCart() {
-  const { items } = useCartState();
-  const dispatch = useCartDispatch();
+  const {
+    cart: items = [],
+    updateItemQty,
+    removeFromCart,
+    addToCart,
+    getCartTotal,
+  } = useCart();
   const navigate = useNavigate();
+
+  const offcanvasRef = useRef(null);
+  const offcanvasInstanceRef = useRef(null);
 
   const total = (items || []).reduce((s, i) => {
     const price = Number(i.price) || 0;
@@ -14,55 +22,172 @@ export default function OffcanvasCart() {
     return s + price * qty;
   }, 0);
 
-  // Fungsi tambah quantity
-  const increaseQty = (itemId) => {
-    const item = items.find((i) => i.id === itemId);
-    dispatch({
-      type: "UPDATE_QTY",
-      payload: { id: itemId, qty: (item.qty || 1) + 1 },
+  // increase qty
+  const increaseQty = (item) => {
+    const newQty = (Number(item.qty) || 1) + 1;
+    updateItemQty({
+      _cid: item._cid,
+      id: item.id,
+      variant: item.variant,
+      qty: newQty,
     });
   };
 
-  // Fungsi kurangi quantity
-  const decreaseQty = (itemId) => {
-    const item = items.find((i) => i.id === itemId);
+  // decrease qty
+  const decreaseQty = (item) => {
     const currentQty = Number(item.qty) || 1;
     if (currentQty > 1) {
-      dispatch({
-        type: "UPDATE_QTY",
-        payload: { id: itemId, qty: currentQty - 1 },
+      const newQty = currentQty - 1;
+      updateItemQty({
+        _cid: item._cid,
+        id: item.id,
+        variant: item.variant,
+        qty: newQty,
       });
     }
   };
 
-  // Fungsi hapus item
-  const removeItem = (itemId) => {
-    dispatch({ type: "REMOVE_ITEM", payload: itemId });
+  const removeItem = (item) => {
+    removeFromCart({ _cid: item._cid, id: item.id, variant: item.variant });
   };
 
-  const handleContinue = (e) => {
-    try {
-      const el = document.getElementById("offcanvasCart");
-      const bs = (window.bootstrap && window.bootstrap.Offcanvas) || null;
-      if (bs && el) {
-        const inst = bs.getInstance(el) || new bs(el);
-        inst.hide();
+  // Initialize Bootstrap Offcanvas instance (if available) and perform tidy-up on unmount
+  useEffect(() => {
+    const el = offcanvasRef.current;
+    const Offcanvas = window.bootstrap && window.bootstrap.Offcanvas;
+
+    if (el && Offcanvas) {
+      try {
+        offcanvasInstanceRef.current =
+          Offcanvas.getInstance && Offcanvas.getInstance(el)
+            ? Offcanvas.getInstance(el)
+            : new Offcanvas(el);
+      } catch (err) {
+        console.warn("Gagal inisialisasi Offcanvas API:", err);
+        offcanvasInstanceRef.current = null;
       }
-    } catch (err) {
-      console.warn("Gagal menutup offcanvas via Bootstrap API:", err);
     }
 
-    setTimeout(() => navigate("/checkout"), 100);
+    // Cleanup function - important to remove inline styles/backdrops that break re-open
+    return () => {
+      try {
+        if (
+          offcanvasInstanceRef.current &&
+          offcanvasInstanceRef.current.dispose
+        ) {
+          offcanvasInstanceRef.current.dispose();
+        }
+      } catch (err) {
+        // ignore
+      }
+
+      if (el) {
+        el.classList.remove("show");
+        el.removeAttribute("style");
+        el.setAttribute("aria-hidden", "true");
+      }
+
+      document.body.classList.remove("offcanvas-open", "modal-open");
+      document
+        .querySelectorAll(".offcanvas-backdrop, .modal-backdrop")
+        .forEach((b) => b.remove());
+
+      offcanvasInstanceRef.current = null;
+    };
+  }, []);
+
+  // Close offcanvas then navigate to checkout. If Bootstrp API present, rely on it and wait for 'hidden' event.
+  const handleContinue = (e) => {
+    const el = offcanvasRef.current;
+    const inst = offcanvasInstanceRef.current;
+
+    try {
+      if (inst && typeof inst.hide === "function") {
+        // Wait for bootstrap's hidden event to navigate so offcanvas can fully reset
+        const onHidden = () => {
+          navigate("/checkout");
+        };
+        el.addEventListener("hidden.bs.offcanvas", onHidden, { once: true });
+        inst.hide();
+      } else if (el) {
+        // Fallback if Bootstrap JS isn't available for some reason
+        // Remove show class and any inline styles that would prevent future opens
+        el.classList.remove("show");
+        el.removeAttribute("style");
+        el.setAttribute("aria-hidden", "true");
+
+        // Remove leftover backdrops and body classes
+        document.body.classList.remove("offcanvas-open", "modal-open");
+        document
+          .querySelectorAll(".offcanvas-backdrop, .modal-backdrop")
+          .forEach((b) => b.remove());
+
+        // Short delay so UI updates, then navigate
+        setTimeout(() => navigate("/checkout"), 50);
+      } else {
+        navigate("/checkout");
+      }
+    } catch (err) {
+      console.warn("Gagal menutup offcanvas atau navigasi:", err);
+      navigate("/checkout");
+    }
   };
 
   return (
     <div
+      ref={offcanvasRef}
       className="offcanvas offcanvas-end"
       data-bs-scroll="true"
       tabIndex="-1"
       id="offcanvasCart"
       aria-labelledby="My Cart"
     >
+      {/* CUSTOM CSS: memastikan garis-garis pada tombol qty terlihat utuh */}
+      <style>{`
+        /* Pastikan offcanvas tidak memotong border tombol */
+        #offcanvasCart .offcanvas-body {
+          overflow: visible;
+        }
+
+        /* Grup qty khusus agar garis tegas dan tidak putus */
+        .cart-qty-btn-group .btn {
+          border-width: 1px !important;
+          border-color: #dee2e6 !important;
+          box-shadow: none !important;
+          position: relative;
+          z-index: 1;
+        }
+
+        /* Hilangkan radius yang menyebabkan border 'terpotong' pada tengah */
+        .cart-qty-btn-group .btn:first-child {
+          border-top-right-radius: 0 !important;
+          border-bottom-right-radius: 0 !important;
+        }
+        .cart-qty-btn-group .qty-display {
+          border-radius: 0 !important;
+          border-left: 0 !important;
+          border-right: 0 !important;
+          pointer-events: none;
+        }
+        .cart-qty-btn-group .btn:last-child {
+          border-top-left-radius: 0 !important;
+          border-bottom-left-radius: 0 !important;
+        }
+
+        /* Pastikan tengahnya terlihat seperti tombol (tetap ada padding) */
+        .cart-qty-btn-group .qty-display {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 36px;
+        }
+
+        /* Agar garis pemisah antar tombol selalu tampak */
+        .cart-qty-btn-group .btn + .btn {
+          margin-left: 0 !important;
+        }
+      `}</style>
+
       <div className="offcanvas-header justify-content-center">
         <button
           type="button"
@@ -86,13 +211,11 @@ export default function OffcanvasCart() {
             )}
             {items.map((i, idx) => (
               <li
-                key={i.id ?? idx}
+                key={i._cid ?? i.id ?? idx}
                 className="list-group-item d-flex justify-content-between lh-sm"
               >
                 <div className="flex-grow-1">
-                  {/* ROW UNTUK GAMBAR & INFO PRODUK */}
                   <div className="row align-items-center">
-                    {/* GAMBAR PRODUK */}
                     <div className="col-3">
                       <img
                         src={i.image || "/placeholder-image.jpg"}
@@ -110,38 +233,48 @@ export default function OffcanvasCart() {
                       />
                     </div>
 
-                    {/* INFO PRODUK */}
                     <div className="col-9">
                       <h6 className="my-0">{i.name}</h6>
                       <small className="text-body-secondary">
                         {i.size || ""}
                       </small>
 
-                      {/* TOMBOL QUANTITY CONTROL */}
                       <div className="mt-2 d-flex align-items-center">
-                        <div className="btn-group btn-group-sm me-3">
+                        {/* gunakan class cart-qty-btn-group untuk custom styling */}
+                        <div
+                          className="btn-group btn-group-sm me-3 cart-qty-btn-group"
+                          role="group"
+                          aria-label="Quantity controls"
+                        >
                           <button
                             className="btn btn-outline-secondary"
-                            onClick={() => decreaseQty(i.id)}
+                            onClick={() => decreaseQty(i)}
                             disabled={(Number(i.qty) || 1) <= 1}
+                            aria-label={`Kurangi jumlah ${i.name}`}
                           >
                             -
                           </button>
-                          <span className="btn btn-outline-light text-dark px-3">
+
+                          {/* Tampilkan qty dengan border yang sama agar tidak 'terpotong' */}
+                          <span
+                            className="btn btn-outline-secondary text-dark px-3 qty-display"
+                            aria-hidden="true"
+                          >
                             {Number(i.qty) || 1}
                           </span>
+
                           <button
                             className="btn btn-outline-secondary"
-                            onClick={() => increaseQty(i.id)}
+                            onClick={() => increaseQty(i)}
+                            aria-label={`Tambah jumlah ${i.name}`}
                           >
                             +
                           </button>
                         </div>
 
-                        {/* TOMBOL HAPUS */}
                         <button
                           className="btn btn-outline-danger btn-sm"
-                          onClick={() => removeItem(i.id)}
+                          onClick={() => removeItem(i)}
                         >
                           Hapus
                         </button>
@@ -150,7 +283,6 @@ export default function OffcanvasCart() {
                   </div>
                 </div>
 
-                {/* SUBTOTAL */}
                 <div className="text-end ms-2">
                   <span className="text-body-secondary d-block">
                     Rp
@@ -164,7 +296,7 @@ export default function OffcanvasCart() {
             ))}
 
             <li className="list-group-item d-flex justify-content-between">
-              <span>Total (Rp)</span>
+              <span>Total</span>
               <strong>Rp{total.toFixed(2)}</strong>
             </li>
           </ul>

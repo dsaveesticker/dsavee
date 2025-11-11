@@ -1,5 +1,6 @@
-// src/pages/Checkout.jsx
+// checkout.jsx
 import React, { useState, useEffect, useRef } from "react";
+import { Link, useNavigate } from "react-router-dom";
 
 // Realtime Database (backend logic)
 import {
@@ -9,7 +10,13 @@ import {
   set,
   update,
   serverTimestamp,
+  onValue,
+  get,
+  runTransaction,
 } from "firebase/database";
+
+// Auth
+import { getAuth, onAuthStateChanged } from "firebase/auth";
 
 // PDF
 import { jsPDF } from "jspdf";
@@ -17,6 +24,7 @@ import "jspdf";
 
 // Cart context (sesuaikan path jika berbeda)
 import { useCartState, useCartDispatch } from "../contexts/index";
+import { useCart } from "../contexts/CartContext";
 
 const colors = {
   primary: "#0B1957",
@@ -28,7 +36,16 @@ const colors = {
   textLight: "#666666",
 };
 
+// same guest key used elsewhere
+const GUEST_KEY = "guest_cart_v1";
+
+// free shipping threshold (Rp)
+const FREE_SHIPPING_THRESHOLD = 100000;
+const DEFAULT_SHIPPING_COST = 10000;
+
 export default function Checkout() {
+  const navigate = useNavigate();
+
   // form fields
   const [customerName, setCustomerName] = useState("");
   const [address, setAddress] = useState("");
@@ -45,28 +62,221 @@ export default function Checkout() {
   const [orderCompleted, setOrderCompleted] = useState(false);
   const [orderData, setOrderData] = useState(null);
 
-  const { items } = useCartState();
+  // cart contexts
+  const { items: ctxItems = [] } = useCartState();
   const dispatch = useCartDispatch();
 
-  // Normalisasi items
-  const normalizedItems = (items || []).map((it, idx) => ({
-    id: it.id ?? `i-${idx}`,
-    productId: it.id ?? `product-${idx}`,
+  const {
+    cart: hookCart = [],
+    removeFromCart, // may be undefined in some implementations
+  } = useCart();
+
+  // --- remote cart listener & auth ---
+  const [remoteCartItems, setRemoteCartItems] = useState(null); // null = not loaded yet
+  const [authUser, setAuthUser] = useState(null);
+
+  const snapshotToArray = (val) => {
+    if (!val) return [];
+    if (Array.isArray(val)) {
+      return val
+        .map((it) => (it && typeof it === "object" ? { ...it } : null))
+        .filter(Boolean);
+    }
+    if (typeof val === "object") {
+      return Object.entries(val)
+        .map(([key, v]) => {
+          if (!v || typeof v !== "object") return null;
+          const looksLikeItem =
+            "id" in v || "name" in v || "price" in v || "qty" in v;
+          if (!looksLikeItem) return null;
+          return { _cid: key, ...v };
+        })
+        .filter(Boolean);
+    }
+    return [];
+  };
+
+  // transfer guest cart (localStorage) to user's RTDB cart (merge) on login
+  const transferGuestCartToUser = async (uid) => {
+    try {
+      if (!uid) return;
+      const raw = localStorage.getItem(GUEST_KEY);
+      if (!raw) return;
+      let guestArr = [];
+      try {
+        guestArr = JSON.parse(raw) || [];
+        if (!Array.isArray(guestArr)) guestArr = [];
+      } catch {
+        guestArr = [];
+      }
+      if (!guestArr || guestArr.length === 0) return;
+
+      const db = getDatabase();
+      const userCartRef = dbRef(db, `users/${uid}/cart`);
+      const snap = await get(userCartRef);
+      let existing = snapshotToArray(snap.exists() ? snap.val() : null);
+
+      // merge by key: id + variant + size + color (best-effort)
+      const keyFor = (it) =>
+        `${it.id || it.productId || ""}::${String(it.variant || "")}::${String(
+          it.size || ""
+        )}::${String(it.color || "")}`;
+
+      const map = new Map();
+      existing.forEach((it) => {
+        const k = keyFor(it);
+        map.set(k, { ...it });
+      });
+      guestArr.forEach((it) => {
+        const normalized = {
+          id: it.id ?? it.productId ?? it._cid ?? it.id,
+          productId: it.productId ?? it.id ?? undefined,
+          name: it.name ?? it.title ?? "Produk",
+          price: Number(it.price) || 0,
+          qty: Number(it.qty ?? it.quantity ?? 1) || 1,
+          size: it.size ?? it.sizeName ?? "",
+          variant: it.variant ?? it.selectedVariant ?? null,
+          color: it.color ?? it.selectedColor ?? null,
+          image: it.image ?? null,
+          // keep original raw if present
+          ...it,
+        };
+        const k = keyFor(normalized);
+        if (map.has(k)) {
+          const ex = map.get(k);
+          ex.qty = Number(ex.qty || 0) + Number(normalized.qty || 0);
+          map.set(k, ex);
+        } else {
+          map.set(k, normalized);
+        }
+      });
+
+      const merged = Array.from(map.values());
+
+      // write merged array to user's cart (best-effort)
+      await set(userCartRef, merged);
+
+      // clear guest cart localStorage
+      localStorage.removeItem(GUEST_KEY);
+    } catch (err) {
+      console.warn("transferGuestCartToUser failed:", err);
+    }
+  };
+
+  useEffect(() => {
+    const auth = getAuth();
+    const unsubAuth = onAuthStateChanged(auth, async (u) => {
+      setAuthUser(u || null);
+      setRemoteCartItems(null);
+
+      // If user just signed in, transfer guest cart first, then attach listener
+      if (u && u.uid) {
+        try {
+          await transferGuestCartToUser(u.uid);
+        } catch (e) {
+          console.warn("transfer error (ignored):", e);
+        }
+
+        try {
+          const db = getDatabase();
+          const cartRef = dbRef(db, `users/${u.uid}/cart`);
+
+          const off = onValue(
+            cartRef,
+            (snap) => {
+              const val = snap.val();
+              const arr = snapshotToArray(val);
+              setRemoteCartItems(arr);
+            },
+            (err) => {
+              console.error("Error listening to user cart:", err);
+              setRemoteCartItems([]); // fail-safe
+            }
+          );
+
+          // prefill profile if available
+          try {
+            const userRef = dbRef(db, `users/${u.uid}`);
+            const userSnap = await get(userRef);
+            if (userSnap.exists()) {
+              const ud = userSnap.val();
+              if (!customerName && ud.name) setCustomerName(ud.name);
+              if (!phone && ud.phone)
+                setPhone(String(ud.phone).replace(/\D/g, ""));
+              if (!email && ud.email) setEmail(ud.email);
+              if (!address && ud.address) setAddress(ud.address);
+            }
+          } catch (prefillErr) {
+            // ignore
+          }
+
+          return () => off();
+        } catch (err) {
+          console.error("setup cart listener failed:", err);
+          setRemoteCartItems([]); // fail-safe
+        }
+      } else {
+        // not logged in (guest)
+        setRemoteCartItems(null);
+      }
+    });
+
+    return () => {
+      try {
+        unsubAuth();
+      } catch {}
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // choose source items: remote when loaded, otherwise context items or guest localStorage
+  const guestItemsFromStorage = (() => {
+    try {
+      const raw = localStorage.getItem(GUEST_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed;
+    } catch {
+      return [];
+    }
+  })();
+
+  const sourceItems =
+    remoteCartItems !== null
+      ? remoteCartItems
+      : ctxItems && ctxItems.length
+      ? ctxItems
+      : guestItemsFromStorage;
+
+  // normalize items (tambahkan variant/color jika ada supaya bisa deteksi stok varian)
+  const normalizedItems = (sourceItems || []).map((it, idx) => ({
+    _cid: it._cid ?? undefined,
+    id: it.id ?? it.productId ?? `i-${idx}`,
+    productId: it.productId ?? it.id ?? `product-${idx}`,
     name: it.name ?? it.title ?? "Produk",
     price: Number(it.price) || 0,
-    qty: Number(it.qty) || 1,
-    size: it.size ?? "",
+    qty: Number(it.qty) || Number(it.quantity) || 1,
+    size: it.size ?? it.sizeName ?? "",
     image: it.image ?? null,
+    // try to keep variant info if present (some cart implementations save variant/color)
+    variant: it.variant ?? it.selectedVariant ?? null,
+    color: it.color ?? it.selectedColor ?? null,
+    imageField: it.imageField ?? null,
   }));
 
   const subtotal = normalizedItems.reduce(
     (s, it) => s + (Number(it.price) || 0) * (Number(it.qty) || 1),
     0
   );
-  const shippingCost = 0;
+
+  // shipping cost logic: free if subtotal (sticker-only total) > threshold
+  const shippingCost =
+    subtotal > FREE_SHIPPING_THRESHOLD ? 0 : DEFAULT_SHIPPING_COST;
+
   const total = subtotal + shippingCost;
 
-  // Draft id (opsional)
+  // draft id logic
   const draftIdRef = useRef(null);
   useEffect(() => {
     let draftId = localStorage.getItem("dsavee_orderDraftId");
@@ -74,25 +284,33 @@ export default function Checkout() {
       draftId = `guest-${Date.now().toString(36)}-${Math.random()
         .toString(36)
         .slice(2, 6)}`;
-      localStorage.setItem("dsavee_orderDraftId", draftId);
+      try {
+        localStorage.setItem("dsavee_orderDraftId", draftId);
+      } catch {}
     }
     draftIdRef.current = draftId;
   }, []);
 
-  // Muat skrip Midtrans Snap secara dinamis
+  // load midtrans script
   useEffect(() => {
     const script = document.createElement("script");
     script.src = "https://app.sandbox.midtrans.com/snap/snap.js";
     script.setAttribute("data-client-key", "Mid-client-yncxXrxPbo1proU3");
     script.async = true;
     document.body.appendChild(script);
+    return () => {
+      try {
+        document.body.removeChild(script);
+      } catch (e) {}
+    };
   }, []);
 
-  // Simple validation (dipakai sebelum submit)
+  // validation
   const validateForm = () => {
     if (!customerName.trim()) return "Masukkan nama penerima.";
     if (!address.trim()) return "Masukkan alamat pengiriman.";
     if (!phone.trim()) return "Masukkan nomor HP.";
+    if (!/^\d+$/.test(phone)) return "Nomor HP hanya boleh berupa angka.";
     if (!email.trim()) return "Masukkan email.";
     if (normalizedItems.length === 0) return "Keranjang kosong.";
     return null;
@@ -108,59 +326,178 @@ export default function Checkout() {
     }
   };
 
-  // PDF generator (sederhanakan bagian payment)
+  // -----------------------
+  // Stock-detection & update helpers
+  // -----------------------
+
+  function imageFieldToStockField(imageField) {
+    if (!imageField) return "stock";
+    const key = String(imageField || "").toLowerCase();
+    if (key === "image" || key === "image0") return "stock";
+    if (key === "image1") return "stock1";
+    if (key === "image2") return "stock2";
+    if (key.endsWith("1")) return "stock1";
+    if (key.endsWith("2")) return "stock2";
+    return "stock";
+  }
+
+  function detectStockFieldFromItem(productData = {}, item = {}) {
+    try {
+      if (!productData) return "stock";
+
+      if (
+        item.color &&
+        typeof item.color === "object" &&
+        item.color.imageField
+      ) {
+        return imageFieldToStockField(item.color.imageField);
+      }
+      if (item.imageField) {
+        return imageFieldToStockField(item.imageField);
+      }
+
+      if (item.color && typeof item.color === "object" && item.color.image) {
+        if (productData.image && productData.image === item.color.image)
+          return "stock";
+        if (productData.image1 && productData.image1 === item.color.image)
+          return "stock1";
+        if (productData.image2 && productData.image2 === item.color.image)
+          return "stock2";
+      }
+
+      if (item.image) {
+        if (productData.image && productData.image === item.image)
+          return "stock";
+        if (productData.image1 && productData.image1 === item.image)
+          return "stock1";
+        if (productData.image2 && productData.image2 === item.image)
+          return "stock2";
+      }
+
+      if (item.variant !== null && item.variant !== undefined) {
+        const maybeIdx = Number(item.variant);
+        if (!Number.isNaN(maybeIdx)) {
+          if (maybeIdx === 0) return "stock";
+          if (maybeIdx === 1) return "stock1";
+          if (maybeIdx === 2) return "stock2";
+        }
+        const m = String(item.variant).match(/\d+/);
+        if (m) {
+          const idx = Number(m[0]) - 1;
+          if (idx === 0) return "stock";
+          if (idx === 1) return "stock1";
+          if (idx === 2) return "stock2";
+        }
+      }
+
+      if (productData.hasOwnProperty("stock")) return "stock";
+      if (productData.hasOwnProperty("stock1")) return "stock1";
+      if (productData.hasOwnProperty("stock2")) return "stock2";
+      return "stock";
+    } catch (e) {
+      console.error("detectStockFieldFromItem error:", e);
+      return "stock";
+    }
+  }
+
+  const decrementStockForItems = async (items = []) => {
+    if (!items || items.length === 0) return;
+    const db = getDatabase();
+
+    for (const it of items) {
+      const productId = it.productId || it.id;
+      const qty = Number(it.qty || 0);
+      if (!productId) continue;
+      if (!qty || qty <= 0) continue;
+
+      const productRef = dbRef(db, `products/${productId}`);
+      let productData = null;
+
+      try {
+        const snap = await get(productRef);
+        productData = snap.exists() ? snap.val() : null;
+
+        const stockField =
+          detectStockFieldFromItem(productData || {}, it) || "stock";
+
+        await runTransaction(productRef, (current) => {
+          if (current === null) return current;
+          const cur = { ...current };
+
+          if (cur[stockField] === undefined || cur[stockField] === null) {
+            cur[stockField] = Number(cur[stockField] ?? 0);
+          }
+
+          const currentStock = Number(cur[stockField] || 0);
+          const newStock = Math.max(0, currentStock - qty);
+          cur[stockField] = newStock;
+
+          return cur;
+        });
+      } catch (err) {
+        console.warn(
+          `Gagal transact mengurangi stok produk ${productId} (${it.name}):`,
+          err
+        );
+        try {
+          const fallbackField = detectStockFieldFromItem(productData || {}, it);
+          const fallbackRef = dbRef(
+            db,
+            `products/${productId}/${fallbackField}`
+          );
+          await runTransaction(fallbackRef, (curVal) => {
+            const curNum = Number(curVal || 0);
+            return Math.max(0, curNum - qty);
+          });
+        } catch (err2) {
+          console.error(
+            `Fallback decrement stok failed untuk produk ${productId}:`,
+            err2
+          );
+        }
+      }
+    }
+  };
+
+  // -----------------------
+  // pdf generator
+  // -----------------------
   const generateReceiptPDF = (order) => {
     try {
       if (!order) {
         alert("Data order tidak tersedia untuk membuat struk");
         return;
       }
-
       const doc = new jsPDF();
-      // Header
       doc.setFontSize(20);
       doc.setTextColor(11, 25, 87);
       doc.text("DSAVEE STICKER", 105, 20, null, null, "center");
-
       doc.setFontSize(12);
       doc.setTextColor(100, 100, 100);
       doc.text("Struk Pembelian", 105, 30, null, null, "center");
-
       doc.setDrawColor(158, 204, 250);
       doc.line(20, 35, 190, 35);
-
-      // Order meta
       doc.setFontSize(10);
       doc.setTextColor(0, 0, 0);
       doc.text(`No. Order: ${order.txId || "N/A"}`, 20, 45);
       doc.text(`Tanggal: ${new Date().toLocaleDateString("id-ID")}`, 20, 52);
       doc.text(`Waktu: ${new Date().toLocaleTimeString("id-ID")}`, 20, 59);
-
-      // Customer
       doc.text(`Nama: ${order.customerName || "N/A"}`, 20, 71);
       doc.text(`Telepon: ${order.phone || "N/A"}`, 20, 78);
       doc.text(`Email: ${order.email || "N/A"}`, 20, 85);
-
-      // Alamat (wrap)
       const addressText = `Alamat: ${order.address || "N/A"}`;
       const addressLines = doc.splitTextToSize(addressText, 170);
       doc.text(addressLines, 20, 92);
       let startY = 92 + addressLines.length * 5;
-
-      // Payment method
       doc.text(
         `Metode Pembayaran: ${(order.paymentMethod || "N/A").toUpperCase()}`,
         20,
         startY + 10
       );
       startY += 14;
-
-      // Items (manual table)
       const tableRows = order.items || [];
       if (tableRows.length > 0) {
         let tableY = startY + 10;
-
-        // header
         doc.setFillColor(11, 25, 87);
         doc.setTextColor(255, 255, 255);
         doc.rect(20, tableY, 170, 8, "F");
@@ -169,10 +506,8 @@ export default function Checkout() {
         doc.text("Qty", 110, tableY + 6);
         doc.text("Harga", 125, tableY + 6);
         doc.text("Subtotal", 155, tableY + 6);
-
         doc.setTextColor(0, 0, 0);
         tableY += 12;
-
         order.items.forEach((item) => {
           if (tableY > 270) {
             doc.addPage();
@@ -191,11 +526,8 @@ export default function Checkout() {
           doc.line(20, tableY + 3, 190, tableY + 3);
           tableY += 10;
         });
-
         startY = tableY;
       }
-
-      // Total
       const finalY = startY + 10;
       doc.setFontSize(12);
       doc.setFont(undefined, "bold");
@@ -204,8 +536,6 @@ export default function Checkout() {
         150,
         finalY
       );
-
-      // Notes
       doc.setFontSize(9);
       doc.setFont(undefined, "normal");
       doc.setTextColor(100, 100, 100);
@@ -236,7 +566,6 @@ export default function Checkout() {
         null,
         "center"
       );
-
       const fileName = `struk-${order.txId || "unknown"}.pdf`;
       doc.save(fileName);
     } catch (err) {
@@ -245,10 +574,90 @@ export default function Checkout() {
     }
   };
 
+  const finalizeOrderCleanup = async () => {
+    try {
+      // 1) try dispatch CLEAR_CART (if your provider supports it)
+      try {
+        dispatch({ type: "CLEAR_CART" });
+      } catch (ctxErr) {
+        console.warn("CLEAR_CART dispatch failed or not supported:", ctxErr);
+      }
+
+      // 2) If removeFromCart exists (the hook used by OffcanvasCart), remove items one-by-one.
+      try {
+        if (typeof removeFromCart === "function") {
+          const toRemove =
+            (hookCart && hookCart.length ? hookCart : ctxItems) || [];
+          for (const it of toRemove) {
+            try {
+              await removeFromCart({
+                _cid: it._cid ?? undefined,
+                id: it.id ?? it.productId,
+                variant: it.variant ?? undefined,
+              });
+            } catch (itErr) {
+              // ignore single-item failures and continue
+            }
+          }
+        }
+      } catch (hookErr) {
+        console.warn("removeFromCart loop error:", hookErr);
+      }
+
+      // 3) Clear RTDB cart for logged-in user (so remote listeners get empty array/null)
+      try {
+        const db = getDatabase();
+        if (authUser && authUser.uid) {
+          await set(dbRef(db, `users/${authUser.uid}/cart`), null);
+        }
+      } catch (dbErr) {
+        console.warn("Failed to clear RTDB user cart:", dbErr);
+      }
+
+      // 4) Clear guest localStorage cart key
+      try {
+        localStorage.removeItem(GUEST_KEY);
+        try {
+          localStorage.setItem(GUEST_KEY, JSON.stringify([]));
+        } catch {}
+      } catch (lsErr) {
+        // ignore
+      }
+
+      // 5) update local state so Checkout UI immediately shows empty cart
+      try {
+        setRemoteCartItems([]);
+      } catch (stErr) {
+        // ignore
+      }
+
+      // 6) remove order draft if any (best-effort)
+      try {
+        const db = getDatabase();
+        if (draftIdRef.current) {
+          await set(dbRef(db, `orderDrafts/${draftIdRef.current}`), null);
+          localStorage.removeItem("dsavee_orderDraftId");
+        }
+      } catch (draftErr) {
+        // ignore
+      }
+    } catch (err) {
+      console.error("finalizeOrderCleanup error:", err);
+    }
+  };
+
   // Handle submit: integrasi Midtrans Snap + RTDB + PDF
   const handleSubmit = async (e) => {
     e.preventDefault();
     setMessage("");
+    // Prevent guests from submitting: require login/signup first
+    if (!authUser) {
+      setMessage(
+        "Silakan daftar / login terlebih dahulu sebelum mengonfirmasi order. Klik Login atau Signup di kotak informasi di sebelah kanan."
+      );
+      return;
+    }
+
     const validationError = validateForm();
     if (validationError) {
       setMessage(validationError);
@@ -258,13 +667,12 @@ export default function Checkout() {
     setMessage("Menyimpan order...");
     const db = getDatabase();
     let orderId = null;
+
     try {
-      // Buat entry order baru di Firebase RTDB
       const ordersRef = dbRef(db, "orders");
       const newOrderRef = push(ordersRef);
       orderId = newOrderRef.key;
 
-      // Susun order object awal (sederhana, hanya field yang relevan)
       const orderObj = {
         orderId,
         customerName,
@@ -273,7 +681,12 @@ export default function Checkout() {
         address,
         items: normalizedItems,
         subtotal,
-        shippingCost,
+        shipping: {
+          courier: null,
+          trackingNumber: null,
+          status: "pending",
+          cost: shippingCost, // store shipping cost
+        },
         total,
         currency: "IDR",
         status: paymentMethod === "cod" ? "pending_payment" : "pending",
@@ -285,17 +698,35 @@ export default function Checkout() {
           txId: null,
           paymentDeadlineInfo: getPaymentDeadline(),
         },
-        shipping: {
-          courier: null,
-          trackingNumber: null,
-          status: "pending",
-        },
       };
 
-      // Simpan order awal ke Firebase
       await set(newOrderRef, orderObj);
 
-      // Hapus draft jika ada
+      // save under users/{uid}/orders if logged in
+      try {
+        if (authUser && authUser.uid) {
+          const userOrderRef = dbRef(
+            db,
+            `users/${authUser.uid}/orders/${orderId}`
+          );
+          await set(userOrderRef, {
+            oid: orderId,
+            date: Date.now(),
+            method: paymentMethod,
+            total,
+            shippingCost,
+            status: orderObj.status,
+            product: normalizedItems,
+          });
+        }
+      } catch (userOrderErr) {
+        console.warn(
+          "Gagal menyimpan order ke users/{uid}/orders:",
+          userOrderErr
+        );
+      }
+
+      // Hapus draft jika ada (best-effort)
       if (draftIdRef.current) {
         try {
           await set(dbRef(db, `orderDrafts/${draftIdRef.current}`), null);
@@ -305,9 +736,8 @@ export default function Checkout() {
         }
       }
 
-      // Jika metode pembayaran COD (Cash on Delivery)
+      // COD flow
       if (paymentMethod === "cod") {
-        // Proses COD (tanpa Midtrans)
         const txId = `COD-${Date.now().toString(36)}-${Math.random()
           .toString(36)
           .slice(2, 5)}`;
@@ -315,12 +745,32 @@ export default function Checkout() {
           "payment/txId": txId,
           txId,
           updatedAt: serverTimestamp ? serverTimestamp() : Date.now(),
+          status: "confirmed",
+          "payment/status": "confirmed",
         });
 
-        // Kosongkan cart
-        dispatch({ type: "CLEAR_CART" });
+        if (authUser && authUser.uid) {
+          try {
+            await update(dbRef(db, `users/${authUser.uid}/orders/${orderId}`), {
+              status: "confirmed",
+              txId,
+            });
+          } catch (e) {
+            // ignore
+          }
+        }
 
-        // Siapkan data untuk struk PDF
+        // ---- DECREMENT STOCK here for COD (confirmed) ----
+        try {
+          await decrementStockForItems(normalizedItems);
+        } catch (stockErr) {
+          console.error("Gagal mengurangi stok setelah COD:", stockErr);
+          // proceed anyway
+        }
+
+        // robust cleanup
+        await finalizeOrderCleanup();
+
         const orderForPdf = {
           txId,
           customerName,
@@ -344,19 +794,26 @@ export default function Checkout() {
         return;
       }
 
-      // Non-COD: Gunakan Midtrans Snap
-      // Kumpulkan detail transaksi untuk Midtrans
+      // Non-COD: Midtrans flow
       const snapParams = {
         transaction_details: {
           order_id: orderId,
           gross_amount: total,
         },
-        item_details: normalizedItems.map((item) => ({
-          id: item.productId,
-          price: item.price,
-          quantity: item.qty,
-          name: item.name,
-        })),
+        item_details: [
+          ...normalizedItems.map((item) => ({
+            id: item.productId,
+            price: item.price,
+            quantity: item.qty,
+            name: item.name,
+          })),
+          {
+            id: "SHIPPING",
+            price: shippingCost,
+            quantity: 1,
+            name: shippingCost === 0 ? "Gratis Ongkir" : "Ongkos Kirim",
+          },
+        ],
         customer_details: {
           first_name: customerName,
           email: email,
@@ -365,7 +822,6 @@ export default function Checkout() {
       };
 
       setMessage("Menghubungkan ke Midtrans...");
-      // Panggil API Midtrans untuk token transaksi (gunakan Server Key di header)
       const tokenResponse = await fetch(
         "http://localhost:5000/api/create-midtrans",
         {
@@ -390,51 +846,91 @@ export default function Checkout() {
         throw new Error("Gagal mendapatkan token transaksi Midtrans");
       }
 
-      // Panggil snap.js untuk menampilkan UI pembayaran Midtrans
+      // call snap
       window.snap.pay(tokenData.token, {
         onSuccess: async (result) => {
           console.log("Midtrans success:", result);
+          setSubmitting(true);
+          setMessage("Pembayaran sukses, memproses order...");
+
           try {
-            const midtransId = result.transaction_id;
-            await update(dbRef(db, `orders/${orderId}`), {
-              status: "confirmed",
-              "payment/status": "confirmed",
-              "payment/txId": midtransId,
+            const midtransId =
+              result.transaction_id ||
+              (result.order_id ? result.order_id : null);
+
+            // ---- DECREMENT STOCK here for Midtrans success (confirmed) ----
+            try {
+              await decrementStockForItems(normalizedItems);
+            } catch (stockErr) {
+              console.error(
+                "Gagal mengurangi stok setelah Midtrans success:",
+                stockErr
+              );
+              // proceed anyway
+            }
+
+            // update order status to confirmed and save txId
+            try {
+              await update(dbRef(db, `orders/${orderId}`), {
+                status: "confirmed",
+                "payment/status": "confirmed",
+                "payment/txId": midtransId,
+                txId: midtransId,
+                updatedAt: serverTimestamp ? serverTimestamp() : Date.now(),
+              });
+
+              if (authUser && authUser.uid) {
+                try {
+                  await update(
+                    dbRef(db, `users/${authUser.uid}/orders/${orderId}`),
+                    { status: "confirmed", txId: midtransId }
+                  );
+                } catch (e) {
+                  // ignore
+                }
+              }
+            } catch (updateErr) {
+              console.error(
+                "Update order after midtrans success failed:",
+                updateErr
+              );
+            }
+
+            // robust cleanup - must ensure UI cart emptied
+            await finalizeOrderCleanup();
+
+            const orderForPdf = {
               txId: midtransId,
-              updatedAt: serverTimestamp ? serverTimestamp() : Date.now(),
-            });
+              customerName,
+              phone,
+              email,
+              address,
+              items: normalizedItems,
+              subtotal,
+              shippingCost,
+              total,
+              paymentMethod,
+              totalPaid: total,
+            };
+
+            setOrderData(orderForPdf);
+            setOrderCompleted(true);
+            setSubmitting(false);
+            setMessage("Pembayaran berhasil!");
+
+            return false;
           } catch (err) {
-            console.error("Update order after success failed:", err);
+            console.error("Error processing midtrans success:", err);
+            setSubmitting(false);
+            setMessage(
+              "Terjadi kesalahan saat memproses order setelah pembayaran."
+            );
           }
-
-          dispatch({ type: "CLEAR_CART" });
-
-          const orderForPdf = {
-            txId: result.transaction_id,
-            customerName,
-            phone,
-            email,
-            address,
-            items: normalizedItems,
-            subtotal,
-            shippingCost,
-            total,
-            paymentMethod,
-            totalPaid: total,
-          };
-
-          setOrderData(orderForPdf);
-          setOrderCompleted(true);
-          setSubmitting(false);
-          setMessage("Pembayaran berhasil!");
-
-          // PENTING: kembalikan false supaya Snap TIDAK melakukan redirect otomatis
-          return false;
         },
         onPending: async (result) => {
           console.log("Midtrans pending:", result);
           try {
-            const midtransId = result.transaction_id;
+            const midtransId = result.transaction_id || result.order_id || null;
             await update(dbRef(db, `orders/${orderId}`), {
               status: "pending",
               "payment/status": "pending",
@@ -442,11 +938,20 @@ export default function Checkout() {
               txId: midtransId,
               updatedAt: serverTimestamp ? serverTimestamp() : Date.now(),
             });
+
+            if (authUser && authUser.uid) {
+              await update(
+                dbRef(db, `users/${authUser.uid}/orders/${orderId}`),
+                { status: "pending", txId: midtransId }
+              );
+            }
           } catch (err) {
             console.error("Update order after pending failed:", err);
           }
 
-          dispatch({ type: "CLEAR_CART" });
+          // NOTE: for pending we DO NOT decrement stock. Wait until confirmed.
+          // robust cleanup
+          await finalizeOrderCleanup();
 
           const orderForPdf = {
             txId: result.transaction_id,
@@ -467,7 +972,6 @@ export default function Checkout() {
           setSubmitting(false);
           setMessage(`Order Berhasil Disimpan! ${getPaymentDeadline()}`);
 
-          // Cegah redirect default Snap
           return false;
         },
         onError: (result) => {
@@ -485,13 +989,13 @@ export default function Checkout() {
       });
     } catch (err) {
       console.error("Checkout error detail:", err);
-      alert("Terjadi error: " + err.message);
+      alert("Terjadi error: " + (err.message || err));
       setSubmitting(false);
       setMessage("Gagal menyimpan order. Silakan coba lagi.");
     }
   };
 
-  // Render input spesifik payment (hanya COD dan Midtrans)
+  // Render payment instructions
   const renderPaymentInputs = () => {
     switch (paymentMethod) {
       case "midtrans":
@@ -746,10 +1250,10 @@ export default function Checkout() {
                 </div>
                 <div style={{ flex: 1 }}>
                   <label style={{ fontWeight: 600, color: colors.primary }}>
-                    Nomor HP
+                    Telepon
                   </label>
                   <input
-                    type="tel"
+                    type="text"
                     value={phone}
                     onChange={(e) => setPhone(e.target.value)}
                     disabled={submitting}
@@ -774,7 +1278,7 @@ export default function Checkout() {
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   disabled={submitting}
-                  placeholder="email@example.com"
+                  placeholder="email@contoh.com"
                   style={{
                     width: "100%",
                     padding: 8,
@@ -792,8 +1296,7 @@ export default function Checkout() {
                   value={address}
                   onChange={(e) => setAddress(e.target.value)}
                   disabled={submitting}
-                  rows={3}
-                  placeholder="Masukkan alamat lengkap"
+                  placeholder="Alamat lengkap"
                   style={{
                     width: "100%",
                     padding: 8,
@@ -806,9 +1309,9 @@ export default function Checkout() {
               <h4
                 style={{
                   color: colors.primary,
-                  marginBottom: 10,
-                  borderBottom: `2px solid ${colors.accent}`,
                   paddingBottom: 8,
+                  borderBottom: `1px dashed ${colors.secondary}`,
+                  marginBottom: 12,
                 }}
               >
                 Metode Pembayaran
@@ -855,13 +1358,75 @@ export default function Checkout() {
 
               {renderPaymentInputs()}
 
+              {/* If user is guest, show information block to prompt login/signup */}
+              {!authUser && (
+                <div
+                  style={{
+                    marginTop: 12,
+                    padding: 16,
+                    borderRadius: 12,
+                    backgroundColor: "#fff9f2",
+                    border: `1px dashed ${colors.secondary}`,
+                  }}
+                >
+                  <div style={{ textAlign: "center" }}>
+                    <i className="fas fa-receipt fa-3x text-muted mb-3"></i>
+                    <h4 style={{ marginTop: 8 }}>Belum Login</h4>
+                    <p style={{ color: colors.textLight }}>
+                      Anda harus mendaftar atau masuk untuk menyelesaikan
+                      pembelian. Barang yang ada di keranjang akan tetap
+                      tersimpan setelah Anda mendaftar/masuk.
+                    </p>
+
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        justifyContent: "center",
+                      }}
+                    >
+                      <Link
+                        to={`/login?redirect=/checkout`}
+                        className="btn"
+                        style={{
+                          backgroundColor: colors.primary,
+                          color: colors.white,
+                          padding: "8px 14px",
+                          borderRadius: 8,
+                          textDecoration: "none",
+                          fontWeight: 600,
+                        }}
+                      >
+                        Login
+                      </Link>
+                      <Link
+                        to={`/signup?redirect=/checkout`}
+                        className="btn"
+                        style={{
+                          backgroundColor: colors.secondary,
+                          color: colors.primary,
+                          padding: "8px 14px",
+                          borderRadius: 8,
+                          textDecoration: "none",
+                          fontWeight: 600,
+                        }}
+                      >
+                        Sign Up
+                      </Link>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div style={{ marginTop: 12 }}>
                 <button
                   type="submit"
-                  disabled={submitting}
+                  disabled={submitting || !authUser}
                   style={{
                     backgroundColor: submitting
                       ? colors.textLight
+                      : !authUser
+                      ? "#d6d6d6"
                       : colors.primary,
                     color: colors.white,
                     padding: 12,
@@ -869,10 +1434,13 @@ export default function Checkout() {
                     border: "none",
                     fontWeight: 600,
                     width: "100%",
+                    cursor: submitting || !authUser ? "not-allowed" : "pointer",
                   }}
                 >
                   {submitting
                     ? "Memproses Order..."
+                    : !authUser
+                    ? "Silakan Login / Daftar untuk Melanjutkan"
                     : `Konfirmasi Order - Rp${total.toLocaleString("id-ID")}`}
                 </button>
               </div>
@@ -907,40 +1475,86 @@ export default function Checkout() {
             <h4 style={{ color: colors.primary, marginBottom: 12 }}>
               Ringkasan Order
             </h4>
+
             <div style={{ marginBottom: 8 }}>
-              {normalizedItems.map((it) => (
-                <div
-                  key={it.id}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    marginBottom: 6,
-                  }}
-                >
-                  <div>
-                    <div style={{ fontWeight: 600 }}>{it.name}</div>
-                    <div style={{ fontSize: 12, color: colors.textLight }}>
-                      {it.size} • x{it.qty}
+              {normalizedItems.length === 0 ? (
+                <div className="text-muted">Keranjang kosong</div>
+              ) : (
+                normalizedItems.map((it) => (
+                  <div
+                    key={it.id}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      marginBottom: 6,
+                    }}
+                  >
+                    <div>
+                      <div style={{ fontWeight: 600 }}>{it.name}</div>
+                      <div style={{ fontSize: 12, color: colors.textLight }}>
+                        {it.size} • x{it.qty}
+                      </div>
                     </div>
+                    <div>Rp{(it.price * it.qty).toLocaleString("id-ID")}</div>
                   </div>
-                  <div>Rp{(it.price * it.qty).toLocaleString("id-ID")}</div>
-                </div>
-              ))}
+                ))
+              )}
             </div>
+
             <hr />
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                marginBottom: 6,
+              }}
+            >
               <div>Subtotal</div>
               <div>Rp{subtotal.toLocaleString("id-ID")}</div>
             </div>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <div>Biaya Kirim</div>
-              <div>Rp{shippingCost.toLocaleString("id-ID")}</div>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                marginBottom: 6,
+                color: shippingCost === 0 ? "green" : "inherit",
+                fontWeight: shippingCost === 0 ? 700 : "normal",
+              }}
+            >
+              <div>{shippingCost === 0 ? "Ongkir" : "Ongkir"}</div>
+              <div>
+                {shippingCost === 0
+                  ? "Gratis"
+                  : `Rp${shippingCost.toLocaleString("id-ID")}`}
+              </div>
             </div>
-            <hr />
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <strong>Total</strong>
-              <strong>Rp{total.toLocaleString("id-ID")}</strong>
+
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontWeight: 700,
+              }}
+            >
+              <div>Total</div>
+              <div>Rp{total.toLocaleString("id-ID")}</div>
             </div>
+
+            {subtotal > FREE_SHIPPING_THRESHOLD && (
+              <div
+                style={{
+                  marginTop: 8,
+                  fontSize: 12,
+                  color: "green",
+                  fontWeight: 600,
+                }}
+              >
+                🎉 Selamat! Subtotal Anda di atas Rp
+                {FREE_SHIPPING_THRESHOLD.toLocaleString("id-ID")} — gratis
+                ongkir.
+              </div>
+            )}
           </div>
         </div>
       </div>
