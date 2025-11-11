@@ -43,6 +43,51 @@ const GUEST_KEY = "guest_cart_v1";
 const FREE_SHIPPING_THRESHOLD = 100000;
 const DEFAULT_SHIPPING_COST = 10000;
 
+// --- Tambahkan helper API base + waitForSnap (letakkan di top-level komponen) ---
+const getApiBase = () => {
+  // 1) gunakan env var jika diset pada build (recommended)
+  if (
+    process.env.REACT_APP_API_BASE &&
+    process.env.REACT_APP_API_BASE.trim() !== ""
+  ) {
+    return process.env.REACT_APP_API_BASE.replace(/\/+$/, ""); // hapus trailing slash
+  }
+  // 2) jika Anda menyuntikkan global saat runtime (optional)
+  if (typeof window !== "undefined" && window.__API_BASE__) {
+    return String(window.__API_BASE__).replace(/\/+$/, "");
+  }
+  // 3) fallback: gunakan same origin (baik untuk setup proxy / when backend is served from same host)
+  if (
+    typeof window !== "undefined" &&
+    window.location &&
+    window.location.origin
+  ) {
+    return window.location.origin;
+  }
+  // 4) terakhir fallback ke localhost (untuk dev)
+  return "http://localhost:5000";
+};
+
+const API_BASE = getApiBase();
+
+// Tunggu snap.js ter-load (avoid calling window.snap.pay sebelum script benar2 ada)
+const waitForSnap = (timeoutMs = 7000) =>
+  new Promise((resolve, reject) => {
+    if (typeof window === "undefined") return reject(new Error("no window"));
+    if (window.snap) return resolve(window.snap);
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (window.snap) {
+        clearInterval(iv);
+        return resolve(window.snap);
+      }
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(iv);
+        return reject(new Error("snap.js not loaded within timeout"));
+      }
+    }, 100);
+  });
+
 export default function Checkout() {
   const navigate = useNavigate();
 
@@ -822,29 +867,86 @@ export default function Checkout() {
       };
 
       setMessage("Menghubungkan ke Midtrans...");
-      const tokenResponse = await fetch(
-        "http://localhost:5000/api/create-midtrans",
-        {
+      // di bagian atas file (setelah imports)
+      const API_BASE = process.env.REACT_APP_API_BASE || "";
+
+      // lalu saat fetch
+      // --- Panggil backend untuk membuat token ---
+      setMessage("Menghubungkan ke Midtrans...");
+
+      let tokenData;
+      try {
+        const tokenResponse = await fetch(`${API_BASE}/api/create-midtrans`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
           body: JSON.stringify(snapParams),
+        });
+
+        // Jika fetch berhasil (server reachable) periksa status
+        if (!tokenResponse.ok) {
+          // ambil teks/error body bila tersedia untuk debug
+          let errText = "";
+          try {
+            errText = await tokenResponse.text();
+          } catch {}
+          throw new Error(
+            `Midtrans proxy returned ${tokenResponse.status}: ${errText}`
+          );
         }
-      );
 
-      const tokenData = await tokenResponse.json();
-      console.log("Midtrans proxy response:", tokenResponse.status, tokenData);
+        // parsing json
+        tokenData = await tokenResponse.json();
 
-      if (!tokenResponse.ok) {
-        throw new Error(
-          `Gagal membuat transaksi Midtrans. (${tokenResponse.status}) ${
-            tokenData && tokenData.error ? tokenData.error : ""
-          }`
+        if (!tokenData || !tokenData.token) {
+          throw new Error(
+            "Gagal mendapatkan token Midtrans dari proxy (response tidak berisi token)."
+          );
+        }
+      } catch (err) {
+        console.error("Fetch create-midtrans failed:", err);
+        // jika error adalah network (ERR_CONNECTION_REFUSED), beri instruksi jelas
+        if (err.message && err.message.includes("Failed to fetch")) {
+          setSubmitting(false);
+          setMessage(
+            "Gagal terhubung ke server pembayaran. Pastikan backend Midtrans berjalan dan REACT_APP_API_BASE telah di-set."
+          );
+        } else {
+          setMessage("Gagal membuat transaksi Midtrans: " + err.message);
+        }
+        setSubmitting(false);
+        return;
+      }
+
+      // --- Pastikan snap.js ter-load dulu ---
+      try {
+        await waitForSnap(8000); // tunggu sampai 8 detik
+      } catch (err) {
+        console.error("snap.js not available:", err);
+        setMessage(
+          "Gagal memuat Midtrans widget. Silakan refresh halaman dan coba lagi."
         );
+        setSubmitting(false);
+        return;
       }
 
-      if (!tokenData || !tokenData.token) {
-        throw new Error("Gagal mendapatkan token transaksi Midtrans");
-      }
+      // --- Panggil popup Midtrans (tokenData.token aman) ---
+      window.snap.pay(tokenData.token, {
+        onSuccess: async (result) => {
+          /* existing onSuccess code */
+        },
+        onPending: async (result) => {
+          /* existing onPending code */
+        },
+        onError: (result) => {
+          /* ... */
+        },
+        onClose: () => {
+          /* ... */
+        },
+      });
 
       // call snap
       window.snap.pay(tokenData.token, {
